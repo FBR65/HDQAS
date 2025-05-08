@@ -1,3 +1,16 @@
+"""
+Hybrid Document Retrieval System
+
+This module implements a hybrid retrieval system that combines vector-based similarity search
+with graph-based retrieval. It uses Qdrant for vector storage and Neo4j for graph relationships.
+
+Key features:
+- Vector similarity search using embeddings
+- Graph-based entity and relationship retrieval
+- Hybrid ranking combining both approaches
+- Support for contextual and filtered searches
+"""
+
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 import logging
@@ -27,20 +40,58 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class RetrievedChunk:
-    """Represents a retrieved document chunk with its metadata"""
+    """
+    Represents a retrieved document chunk with its metadata and relationships.
+
+    Attributes:
+        chunk_id (str): Unique identifier for the chunk
+        parent_id (str): ID of the parent document/chunk
+        text (str): Actual content of the chunk
+        score (float): Relevance score (0-1)
+        metadata (Dict): Additional chunk metadata
+        source_type (str): Origin of retrieval ('vector', 'graph', or 'contextual')
+        entities (List[tuple]): Named entities found in the chunk
+        relationships (List[tuple]): Entity relationships in the chunk
+        children (List[str]): IDs of child chunks
+    """
 
     chunk_id: str
+    parent_id: str
     text: str
     score: float
     metadata: Dict
     source_type: str  # 'vector' or 'graph'
     entities: List[tuple] = None
     relationships: List[tuple] = None
+    children: List[str] = None
 
 
 class HybridRetriever:
+    """
+    A hybrid retrieval system combining vector search and graph-based retrieval.
+
+    This class provides methods for searching document chunks using both vector similarity
+    and graph relationships, allowing for rich contextual queries and entity-based filtering.
+
+    Attributes:
+        collection_name (str): Name of the Qdrant collection to search
+        qdrant (QdrantClient): Client for vector database operations
+        graph_db (Graph): Neo4j graph database client
+        llm_client (OpenAI): Client for generating embeddings
+        nlp (spacy): SpaCy NLP model for entity extraction
+        local_model (SentenceTransformer): Local embedding model for fallback
+    """
+
     def __init__(self, collection_name: str):
-        """Initialize retriever with necessary clients and models"""
+        """
+        Initialize the hybrid retriever with necessary clients and models.
+
+        Args:
+            collection_name (str): Name of the Qdrant collection to search
+
+        Raises:
+            Exception: If the specified collection doesn't exist
+        """
         self.collection_name = collection_name
 
         # Initialize clients
@@ -63,7 +114,18 @@ class HybridRetriever:
         self.local_model = SentenceTransformer("all-MiniLM-L6-v2")
 
     async def get_embedding(self, text: str) -> List[float]:
-        """Generate embeddings"""
+        """
+        Generate embeddings for input text using OpenAI's API.
+
+        Args:
+            text (str): Text to generate embeddings for
+
+        Returns:
+            List[float]: Vector embedding of the input text
+
+        Raises:
+            Exception: If embedding generation fails
+        """
         try:
             # OpenAI client is synchronous, no need for await
             response = self.llm_client.embeddings.create(
@@ -81,9 +143,21 @@ class HybridRetriever:
         min_score: float = 0.1,
         use_graph: bool = True,
         metadata_filter: Optional[Dict] = None,
+        include_children: bool = True,
     ) -> List[RetrievedChunk]:
         """
-        Hybrid retrieval combining vector similarity and graph-based search
+        Perform hybrid retrieval combining vector similarity and graph-based search.
+
+        Args:
+            query (str): Search query text
+            top_k (int): Maximum number of results to return
+            min_score (float): Minimum similarity score threshold
+            use_graph (bool): Whether to include graph-based results
+            metadata_filter (Dict, optional): Filters to apply to the search
+            include_children (bool): Whether to include child chunks in results
+
+        Returns:
+            List[RetrievedChunk]: Sorted list of retrieved chunks with metadata
         """
         results = []
 
@@ -104,12 +178,26 @@ class HybridRetriever:
 
         # Process vector results from first query
         for point in vector_results:
+            parent_id = point.payload.get("parent_id")
+            children = []
+
+            if include_children and parent_id:
+                # Get sibling chunks with the same parent
+                siblings = self.qdrant.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter={"parent_id": parent_id},
+                    limit=100,
+                )[0]
+                children = [s.id for s in siblings if s.id != point.id]
+
             chunk = RetrievedChunk(
                 chunk_id=point.id,
+                parent_id=parent_id,
                 text=point.payload["text"],
                 score=point.score,
                 metadata=point.payload.get("metadata", {}),
                 source_type="vector",
+                children=children,
             )
             results.append(chunk)
 
@@ -151,12 +239,14 @@ class HybridRetriever:
 
                         chunk = RetrievedChunk(
                             chunk_id=chunk_id,
+                            parent_id=None,
                             text=point.payload["text"],
                             score=record["matches"] / len(query_entities),
                             metadata=point.payload.get("metadata", {}),
                             source_type="graph",
                             entities=entities,
                             relationships=relationships,
+                            children=[],
                         )
                         results.append(chunk)
 
@@ -165,7 +255,17 @@ class HybridRetriever:
         return results[:top_k]
 
     def _get_graph_context(self, chunk_id: str) -> tuple[List[tuple], List[tuple]]:
-        """Get entities and relationships for a chunk from Neo4j"""
+        """
+        Retrieve entities and relationships for a chunk from Neo4j.
+
+        Args:
+            chunk_id (str): ID of the chunk to get context for
+
+        Returns:
+            tuple: (entities, relationships) where each is a list of tuples
+                  entities: [(name, label), ...]
+                  relationships: [(entity1, relationship_type, entity2), ...]
+        """
         # Get entities
         entity_query = """
         MATCH (d:DocumentChunk {id: $chunk_id})-[:MENTIONS]->(e:Entity)
@@ -197,7 +297,15 @@ class HybridRetriever:
         relationship_type: Optional[str] = None,
     ) -> List[RetrievedChunk]:
         """
-        Specialized search focusing on specific entity or relationship types
+        Perform specialized search focusing on specific entity or relationship types.
+
+        Args:
+            query (str): Search query text
+            entity_type (str, optional): Type of entity to focus search on
+            relationship_type (str, optional): Type of relationship to focus on
+
+        Returns:
+            List[RetrievedChunk]: List of chunks matching the contextual criteria
         """
         if entity_type:
             # Search for chunks with specific entity types
@@ -240,6 +348,7 @@ class HybridRetriever:
             for point in points:
                 chunk = RetrievedChunk(
                     chunk_id=point.id,
+                    parent_id=None,
                     text=point.payload["text"],
                     score=0.0,  # Will be updated with semantic similarity
                     metadata=point.payload.get("metadata", {}),

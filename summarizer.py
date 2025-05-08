@@ -1,3 +1,17 @@
+"""
+Document Summarization Module
+
+This module provides functionality for retrieving and summarizing documents from a Qdrant
+vector database. It supports both direct summarization and map-reduce approaches for
+handling large document collections efficiently.
+
+Features:
+- Automatic token counting and limit handling
+- Fallback mechanisms for handling large documents
+- Rate limiting and error handling
+- Progress logging
+"""
+
 import logging
 from typing import List
 
@@ -32,8 +46,20 @@ except ImportError:
 
 class QdrantSummarizer:
     """
-    A class for retrieving ALL texts from a Qdrant collection and summarizing them,
-    using direct or map-reduce strategy based on estimated token count.
+    A class for retrieving and summarizing documents from a Qdrant collection.
+
+    This class implements two summarization strategies:
+    1. Direct summarization for smaller document sets
+    2. Map-reduce summarization for large document collections
+
+    The choice of strategy is automatic based on token count estimation.
+
+    Attributes:
+        collection_name (str): Name of the Qdrant collection
+        client (OpenAI): OpenAI API client
+        summarization_model (str): Name of the model to use for summarization
+        qdrant_client (QdrantClient): Qdrant database client
+        token_threshold (int): Token limit for choosing summarization strategy
     """
 
     MAP_REDUCE_THRESHOLD_PERCENT = 0.85
@@ -86,8 +112,17 @@ class QdrantSummarizer:
             # raise ValueError(f"Collection '{self.collection_name}' nicht gefunden oder Qdrant nicht erreichbar.") from e
 
     def _estimate_tokens(self, text: str) -> int:
-        """Schätzt die Anzahl der Tokens für einen gegebenen Text."""
-        # (Unverändert)
+        """
+        Estimate the number of tokens in a text.
+
+        Uses tiktoken if available, falls back to character-based estimation.
+
+        Args:
+            text (str): Text to estimate tokens for
+
+        Returns:
+            int: Estimated number of tokens
+        """
         if tokenizer:
             try:
                 return len(tokenizer.encode(text))
@@ -99,9 +134,18 @@ class QdrantSummarizer:
         else:
             return int(len(text) * self.APPROX_TOKENS_PER_CHAR)
 
-    def retrieve_all_texts(self) -> List[str]:  # Kein 'limit' Parameter mehr
+    def retrieve_all_texts(self) -> List[str]:
         """
-        Retrieves ALL texts from the specified Qdrant collection.
+        Retrieve all document texts from the Qdrant collection.
+
+        Features:
+        - Batch processing with scrolling
+        - Duplicate detection
+        - Progress logging
+        - Error handling with partial results
+
+        Returns:
+            List[str]: All retrieved document texts
         """
         texts = []
         next_page_offset = None
@@ -187,8 +231,22 @@ class QdrantSummarizer:
     def _summarize_chunk(
         self, chunk_text: str, max_tokens: int, attempt: int = 1
     ) -> str:
-        """Helper-Funktion zum Zusammenfassen eines einzelnen Text-Chunks."""
-        # (Unverändert)
+        """
+        Summarize a single chunk of text.
+
+        Features:
+        - Retry logic for rate limits
+        - Error handling for context length
+        - Fallback text for errors
+
+        Args:
+            chunk_text (str): Text to summarize
+            max_tokens (int): Maximum tokens in summary
+            attempt (int): Current retry attempt number
+
+        Returns:
+            str: Generated summary or error message
+        """
         system_prompt = "Fasse den folgenden Text prägnant und objektiv zusammen."
         user_prompt = f"Text:\n{chunk_text}\n\nZusammenfassung:"
         try:
@@ -224,8 +282,21 @@ class QdrantSummarizer:
             return f"[Fehler bei Zusammenfassung] {chunk_text[:100]}..."
 
     def _map_reduce_summarize(self, texts: List[str], max_tokens_final: int) -> str:
-        """Führt die Map-Reduce-Zusammenfassung durch."""
-        # (Unverändert)
+        """
+        Perform map-reduce summarization on a large set of texts.
+
+        Process:
+        1. Split texts into manageable chunks
+        2. Summarize each chunk (map phase)
+        3. Combine summaries into final summary (reduce phase)
+
+        Args:
+            texts (List[str]): List of texts to summarize
+            max_tokens_final (int): Maximum tokens in final summary
+
+        Returns:
+            str: Final combined summary
+        """
         logger.info("Starte Map-Reduce-Zusammenfassung...")
         intermediate_summaries = []
         current_chunk = []
@@ -299,9 +370,20 @@ class QdrantSummarizer:
 
     def summarize_texts(self, texts: List[str], max_tokens: int = 500) -> str:
         """
-        Summarizes a list of texts, choosing between direct and map-reduce strategy.
+        Summarize a list of texts using the appropriate strategy.
+
+        Features:
+        - Automatic strategy selection based on token count
+        - Fallback from direct to map-reduce if needed
+        - Comprehensive error handling
+
+        Args:
+            texts (List[str]): List of texts to summarize
+            max_tokens (int): Maximum tokens in final summary
+
+        Returns:
+            str: Generated summary or error message
         """
-        # (Unverändert)
         if not texts:
             return "Kein Text zur Zusammenfassung vorhanden."
         full_text = "\n\n---\n\n".join(texts)

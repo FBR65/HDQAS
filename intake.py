@@ -57,6 +57,24 @@ class Document:
 
 
 def semantic_chunking(text, threshold_percentile=25):
+    """
+    Splits text into semantic chunks based on sentence similarity.
+
+    This function:
+    1. Splits text into sentences
+    2. Generates embeddings for each sentence
+    3. Calculates cosine similarity between adjacent sentences
+    4. Groups sentences into chunks based on similarity threshold
+
+    Args:
+        text (str): The text to be split into chunks
+        threshold_percentile (int): Percentile value (0-100) to determine similarity
+            threshold. Lower values create more chunks. Default: 25
+
+    Returns:
+        list: A list of text chunks where each chunk contains semantically
+            related sentences
+    """
     doc = nlp(text)
     sentences = [sent.text for sent in doc.sents]
     embeddings = model.encode(sentences)
@@ -77,6 +95,28 @@ def semantic_chunking(text, threshold_percentile=25):
 
 
 class DataIntake:
+    """
+    A class to handle the ingestion and processing of documents into vector and graph databases.
+
+    This class manages the entire document intake pipeline including:
+    - Document parsing and text extraction
+    - Semantic chunking of text
+    - Vector embeddings generation
+    - Storage in Qdrant vector database
+    - Entity extraction and relationship mapping
+    - Storage in Neo4j graph database
+
+    Attributes:
+        collection_name (str): Name of the Qdrant collection
+        file_path (str): Path to the input document
+        client (OpenAI): OpenAI client for embeddings
+        embedding_model (str): Name of the embedding model
+        qdrant_client (QdrantClient): Client for vector database operations
+        local_model (SentenceTransformer): Fallback embedding model
+        graph (Graph): Neo4j graph database connection
+        chunk_hierarchy (dict): Tracks parent-child relationships between chunks
+    """
+
     def __init__(self, collection_name, file_path) -> None:
         """
         Initialize the data_intake object with dense embedding model,
@@ -126,7 +166,23 @@ class DataIntake:
             self.relation_extraction_tokenizer = None
             self.relation_extraction_model = None
 
+        # Add chunk tracking
+        self.chunk_hierarchy = {}
+        self.current_parent_id = None
+
     def organize_intake(self):
+        """
+        Orchestrates the complete document intake process.
+
+        Steps:
+        1. Streams and parses the document
+        2. Creates necessary Qdrant collections
+        3. Splits text into semantic chunks
+        4. Processes chunks and stores in databases
+
+        Returns:
+            str: Completion timestamp
+        """
         logging.info(f"Intake process started at: {dt.now()}")
         text = self.stream_document(self.file_path)
         logging.info(f"Stream Document ended at: {dt.now()}")
@@ -144,6 +200,15 @@ class DataIntake:
         return f"Finished at: {dt.now()}"
 
     def stream_document(self, path):
+        """
+        Parses a document using Apache Tika and extracts content and metadata.
+
+        Args:
+            path (str): Path to the document file
+
+        Returns:
+            Document: Object containing document content and metadata
+        """
         logging.info("Stream Document started.")
         parsed = parser.from_file(path, serverEndpoint=TIKA_SERVER_URL)
         if "resourceName" in parsed["metadata"]:
@@ -159,6 +224,12 @@ class DataIntake:
         return document
 
     def generate_point_id(self):
+        """
+        Generates a unique identifier for vector database points using UUID4.
+
+        Returns:
+            str: Modified UUID string for use as point ID
+        """
         uuid_value = uuid.uuid4().hex
         modified_uuid = "".join(
             (
@@ -172,6 +243,12 @@ class DataIntake:
         return str(modified_uuid)
 
     def client_collection(self):
+        """
+        Creates Qdrant collections with different distance metrics and payload indexing.
+
+        Returns:
+            str: Status of collection creation
+        """
         collection_distances = ["COSINE"]
         for distances in collection_distances:
             collection = self.collection_name + "_" + str(distances)
@@ -213,26 +290,63 @@ class DataIntake:
         return "created"
 
     def split_into_chunks(self, text, output_dir="temp_chunks"):
+        """
+        Splits document text into semantic chunks using sentence embeddings.
+
+        Args:
+            text (str): Document text to split
+            output_dir (str): Directory for temporary chunk storage
+
+        Returns:
+            list: Paths to generated chunk files
+        """
         if not os.path.exists(output_dir):
             try:
                 os.makedirs(output_dir)
             except Exception as e:
                 print(f"Error creating directory '{output_dir}': {e}")
+
         chunk_files = []
         chunks = semantic_chunking(text)
         chunk_index = 0
-        for chunk in chunks:
+        current_parent_id = str(uuid.uuid4())
+
+        for i, chunk in enumerate(chunks):
+            # Create new parent every 5 chunks
+            if i % 5 == 0:
+                current_parent_id = str(uuid.uuid4())
+
             chunk_filename = os.path.join(output_dir, f"chunk_{chunk_index}.json")
+            chunk_id = str(uuid.uuid4())
+
+            chunk_data = {
+                "text": chunk,
+                "metadata": {
+                    "chunk_id": chunk_id,
+                    "parent_id": current_parent_id,
+                    "position": i,
+                },
+            }
+
             with open(chunk_filename, "w", encoding="utf-8") as f:
-                json.dump({"text": chunk}, f)
+                json.dump(chunk_data, f)
+
+            self.chunk_hierarchy[chunk_id] = current_parent_id
             chunk_files.append(chunk_filename)
             chunk_index += 1
-        logging.info(f"Saved {len(chunk_files)} chunks to '{output_dir}'.")
+
         return chunk_files
 
     def extract_graph_data(self, chunk, metadata):
         """
-        Extract entities and relationships from a text chunk using rule-based coreference resolution.
+        Extracts named entities and relationships from text using NLP models.
+
+        Args:
+            chunk (str): Text chunk to analyze
+            metadata (dict): Document metadata
+
+        Returns:
+            tuple: (entities, relationships) found in the text
         """
         doc = nlp(chunk)
         resolved_text = self._resolve_coreferences(doc)
@@ -268,7 +382,13 @@ class DataIntake:
 
     def _resolve_coreferences(self, doc):
         """
-        Rule-based coreference resolution implementation.
+        Performs rule-based coreference resolution on spaCy document.
+
+        Args:
+            doc (spacy.Doc): Processed spaCy document
+
+        Returns:
+            str: Text with resolved coreferences
         """
         mentions = {}
         resolved_text = doc.text
@@ -292,14 +412,29 @@ class DataIntake:
     def create_graph_nodes_and_relationships(
         self, entities, relationships, chunk_id, metadata
     ):
+        """
+        Creates nodes and relationships in Neo4j graph database.
+
+        Args:
+            entities (list): Extracted named entities
+            relationships (list): Extracted relationships
+            chunk_id (str): Unique identifier for the chunk
+            metadata (dict): Document metadata
+        """
         tx = self.graph.begin()
 
-        # Create document chunk node
+        # Create document chunk node with parent reference
         source_node = Node("DocumentChunk")
         source_node["id"] = chunk_id
+        source_node["parent_id"] = self.chunk_hierarchy.get(chunk_id)
         source_node["source"] = metadata.get("file_name")
-        # Merge on the "id" property
         tx.merge(source_node, "DocumentChunk", "id")
+
+        # If this is a parent node, create parent-child relationship
+        if chunk_id in self.chunk_hierarchy.values():
+            parent_node = Node("ParentChunk")
+            parent_node["id"] = chunk_id
+            tx.merge(parent_node, "ParentChunk", "id")
 
         created_entities = {}
         for entity_text, entity_label in entities:
@@ -335,6 +470,18 @@ class DataIntake:
         tx.commit()
 
     def fill_database(self, chunk_file_paths, metadata):
+        """
+        Processes chunks and stores them in vector and graph databases.
+
+        Features:
+        - Retries with exponential backoff
+        - Fallback to local embedding model
+        - Error handling and logging
+
+        Args:
+            chunk_file_paths (list): Paths to chunk files
+            metadata (dict): Document metadata
+        """
         collection_distances = ["COSINE"]
         max_retries = 5
         retry_delay = 3
@@ -396,6 +543,7 @@ class DataIntake:
                     payload = {
                         "text": chunk,
                         "chunk_id": point_id,
+                        "parent_id": self.chunk_hierarchy.get(point_id),
                         "embedding_source": embedding_source,
                     }
 
@@ -480,6 +628,7 @@ class DataIntake:
 
 
 if __name__ == "__main__":
+    # Example usage of the DataIntake class
     file_path = "./data/41382-8.txt"
     collection_name = "sum_collection"
     intake = DataIntake(collection_name=collection_name, file_path=file_path)

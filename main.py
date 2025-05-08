@@ -1,3 +1,10 @@
+"""
+Main Module for Question Answering System
+
+This module combines the hybrid retriever and summarizer components to provide
+document-based question answering and text summarization capabilities.
+"""
+
 import logging
 from retriever import HybridRetriever
 from summarizer import QdrantSummarizer
@@ -16,7 +23,27 @@ logger = logging.getLogger(__name__)
 
 
 class Answering:
+    """
+    A class that provides question answering and text summarization functionality.
+
+    This class combines the HybridRetriever and QdrantSummarizer to either:
+    1. Answer specific questions based on retrieved relevant documents
+    2. Generate comprehensive summaries of all documents in the collection
+
+    Attributes:
+        collection_name (str): Name of the Qdrant collection to use
+        retriever (HybridRetriever): Instance for document retrieval
+        summarizer (QdrantSummarizer): Instance for text summarization
+        client (OpenAI): OpenAI client for generating responses
+    """
+
     def __init__(self, collection_name: str):
+        """
+        Initialize the Answering system.
+
+        Args:
+            collection_name (str): Name of the Qdrant collection to use
+        """
         self.collection_name = collection_name
         self.retriever = HybridRetriever(collection_name=collection_name)
         self.summarizer = QdrantSummarizer(collection_name=collection_name)
@@ -30,6 +57,22 @@ class Answering:
         top_k: int = 10,
         use_graph: bool = True,
     ) -> str:
+        """
+        Generate an answer or summary based on the documents.
+
+        Args:
+            question (str): The question to answer or topic to summarize
+            use_type (str): Type of processing - "retriever" for QA, anything else for summarization
+            max_tokens (int): Maximum tokens in the response
+            top_k (int): Number of documents to retrieve for answering
+            use_graph (bool): Whether to use graph-based retrieval
+
+        Returns:
+            str: Generated answer or summary
+
+        Raises:
+            Exception: If document retrieval or response generation fails
+        """
         try:
             if use_type == "retriever":
                 # Use the retriever to find relevant documents
